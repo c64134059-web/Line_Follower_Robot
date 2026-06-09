@@ -1,0 +1,231 @@
+#define REMOTEXY_MODE__ESP32CORE_BLE
+#include <BLEDevice.h>
+#include <EEPROM.h>
+#include <RemoteXY.h>
+
+#define REMOTEXY_BLUETOOTH_NAME "RemoteXY"
+
+#pragma pack(push, 1)  
+uint8_t const PROGMEM RemoteXY_CONF_PROGMEM[] =   
+  { 254,4,0,0,0,0,0,3,0,0,1,0,1,1,0,2,1,0,68,0,
+  21,0,0,0,0,31,1,106,200,1,1,5,0,4,10,49,86,9,128,36,
+  26,4,10,94,86,9,128,148,26,4,11,143,86,9,128,191,26,129,24,17,
+  53,12,64,8,67,111,110,116,114,111,108,108,101,114,0,1,39,163,24,24,
+  0,1,31,83,84,79,80,0 };
+  
+struct {
+  int8_t Kp_slider; 
+  int8_t Kd_slider; 
+  int8_t Ki_slider; 
+  uint8_t EBS_bottom; 
+} RemoteXY;   
+#pragma pack(pop)
+
+// 左馬達引腳定義
+#define PWMA 2   
+#define AIN1 15  
+#define AIN2 13  
+
+// 右馬達引腳定義
+#define PWMB 14  
+#define BIN1 16  
+#define BIN2 17  
+
+const int sensorPins[5] = {32, 33, 34, 35, 39}; 
+int sensorValues[5] = {1, 1, 1, 1, 1}; 
+
+#define VLS_BUTTON_PIN 18   
+#define ASL_RED        21   
+#define ASL_GREEN      22   
+#define ASL_BLUE       4    
+
+boolean hasLanded = false;       
+boolean hasLaunched = false;     
+unsigned long landTime = 0;      
+const unsigned long launchDelay = 3000; 
+
+boolean EBS_triggered = false;
+
+// --- 🌟 150 高速極限 PID 參數配置 🌟 ---
+int BASE_SPEED = 150; // 🚀 基礎速度設定為 150
+float Kp = 5.0;       // 🚀 預設實際 Kp 直接拉高到 5.0 (相當於手機滑塊拉到 50)
+float Ki = 0.0;   
+float Kd = 8.0;       // 🚀 預設實際 Kd 同步拉高到 8.0 (相當於手機滑塊拉到 40)
+
+float error = 0.0;
+float lastError = 0.0;
+float integral = 0.0;
+float derivative = 0.0;
+
+void setLedStatus(uint8_t green, uint8_t red, uint8_t blue) {
+  digitalWrite(ASL_GREEN, green);
+  digitalWrite(ASL_RED, red);
+  digitalWrite(ASL_BLUE, blue);
+}
+
+void motor_drive_native(int leftSpeed, int rightSpeed) {
+  // 🌟 左右輪速度限制回到 225
+  leftSpeed = constrain(leftSpeed, -225, 225);
+  rightSpeed = constrain(rightSpeed, -225, 225);
+
+  if (leftSpeed >= 0) {
+    digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW); analogWrite(PWMA, leftSpeed); 
+  } else {
+    digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH); analogWrite(PWMA, abs(leftSpeed));
+  }
+
+  if (rightSpeed >= 0) {
+    digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW); analogWrite(PWMB, rightSpeed);
+  } else {
+    digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH); analogWrite(PWMB, abs(rightSpeed));
+  }
+}
+
+void motor_stop_native() {
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW); analogWrite(PWMA, 0);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW); analogWrite(PWMB, 0);
+}
+
+void setup() {
+  Serial.begin(115200); 
+  delay(500); 
+
+  pinMode(PWMA, OUTPUT); pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT); pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+  motor_stop_native(); 
+
+  RemoteXY_Init();  
+  EEPROM.begin(RemoteXYEngine.getEepromSize()); 
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
+  pinMode(VLS_BUTTON_PIN, INPUT_PULLUP);
+  
+  pinMode(ASL_RED, OUTPUT);
+  pinMode(ASL_GREEN, OUTPUT);
+  pinMode(ASL_BLUE, OUTPUT); 
+
+  setLedStatus(LOW, LOW, HIGH); 
+}
+
+void loop() { 
+  RemoteXYEngine.handler();   
+  
+  // 安全調參防覆蓋：滑塊大於 0 採納手機設定，否則死鎖在預設極限值
+  if (RemoteXY.Kp_slider > 0) { Kp = (float)RemoteXY.Kp_slider / 2.0; } else { Kp = 5.0; }
+  if (RemoteXY.Ki_slider > 0) { Ki = (float)RemoteXY.Ki_slider / 100.0; } else { Ki = 0.0; }
+  if (RemoteXY.Kd_slider > 0) { Kd = (float)RemoteXY.Kd_slider / 5.0; } else { Kd = 8.0; }
+  
+  if (RemoteXY.EBS_bottom == 1 || EBS_triggered == true) {
+    EBS_triggered = true;           
+    motor_stop_native();   
+    setLedStatus(HIGH, LOW, LOW); 
+    return;                         
+  }
+  
+  if (hasLanded == false) {
+    setLedStatus(LOW, LOW, HIGH); 
+    int onBlackLine = 0; 
+    
+    Serial.print("【測試模式】Sensors: [ ");
+    for (int i = 0; i < 5; i++) {
+      sensorValues[i] = digitalRead(sensorPins[i]);
+      Serial.print(sensorValues[i]);
+      Serial.print(" ");
+      if (sensorValues[i] == 0) {
+        onBlackLine = 1; 
+      }
+    }
+    Serial.print("] | PID參數 -> Kp:"); Serial.print(Kp);
+    Serial.print(" Ki:"); Serial.print(Ki);
+    Serial.print(" Kd:"); Serial.println(Kd);
+    delay(100);
+    
+    if (digitalRead(VLS_BUTTON_PIN) == LOW) {
+      delay(50); 
+      if (digitalRead(VLS_BUTTON_PIN) == LOW) { 
+        if (onBlackLine == 1) {
+          hasLanded = true; 
+          landTime = millis();                    
+          Serial.println("➔ 成功偵測到黑線，允許解鎖！進入自主導航倒數。");
+          while(digitalRead(VLS_BUTTON_PIN) == LOW) { delay(10); } 
+        } else {
+          Serial.println("⚠️ 警告：全白地未踩線，拒絕觸發自動導航！");
+        }
+      }
+    }
+    motor_stop_native();
+  }
+  else if (hasLanded == true && hasLaunched == false) {
+    setLedStatus(LOW, HIGH, LOW); 
+    if (millis() - landTime >= launchDelay) { 
+      hasLaunched = true; 
+    } else { 
+      motor_stop_native(); 
+    }
+  }
+  else if (hasLaunched == true) {
+    setLedStatus(LOW, HIGH, LOW); 
+    pid_line_follow(); 
+  }
+}
+
+void pid_line_follow() {
+  int numBlackActive = 0; 
+  float sumWeights = 0.0;
+
+  for (int i = 0; i < 5; i++) {
+    sensorValues[i] = digitalRead(sensorPins[i]);
+    if (sensorValues[i] == 0) { 
+      numBlackActive++;
+      if (i == 0) sumWeights += -3.0;
+      if (i == 1) sumWeights += -1.5;
+      if (i == 2) sumWeights += 0.0;
+      if (i == 3) sumWeights += 1.5;
+      if (i == 4) sumWeights += 3.0;
+    }
+  }
+
+  if (numBlackActive == 0) {
+    EBS_triggered = true;         
+    motor_stop_native();          
+    setLedStatus(HIGH, LOW, LOW); 
+    hasLanded = false;            
+    hasLaunched = false;
+    Serial.println("🚨 [EBS出軌保護] 偵測到全白地(1 1 1 1 1)！安全鎖死煞停！");
+    return; 
+  }
+
+  error = sumWeights / (float)numBlackActive;
+
+  integral += error;
+  integral = constrain(integral, -100, 100); 
+  
+  derivative = error - lastError;
+
+  float turnControl = (Kp * error) + (Ki * integral) + (Kd * derivative);
+  
+  lastError = error;
+
+  // 🌟【超高速彎道主動防滑機制】：
+  // 當車子大幅度偏離（abs(error) > 1.0）時，代表正在全速衝進急彎。
+  // 我們直接強行將基礎速度扣掉 40（降到 110），確保強大的速差配合主動煞車能把車頭甩回賽道！
+  int dynamicBaseSpeed = BASE_SPEED;
+  if (abs(error) > 1.0) {
+    dynamicBaseSpeed = BASE_SPEED - 40; 
+  }
+
+  int lsp = dynamicBaseSpeed + turnControl;
+  int rsp = dynamicBaseSpeed - turnControl;
+
+  // 實時速度監控
+  Serial.print("RUNNING -> Error: "); Serial.print(error);
+  Serial.print(" | Turn: "); Serial.print(turnControl);
+  Serial.print(" | LSP: "); Serial.print(lsp);
+  Serial.print(" | RSP: "); Serial.println(rsp);
+
+  motor_drive_native(lsp, rsp);
+  
+  delay(10); // 🚀 150的高速下，採樣時間壓縮到 10ms，提高反應頻率
+}
